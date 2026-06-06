@@ -104,14 +104,14 @@ class Jura : public PollingComponent, public uart::UARTDevice {
 
       byte trayBit       = bitRead(a, 4);
       byte left_readyBit = bitRead(a, 2);
-      byte tankBit       = bitRead(b, 5);
+      byte tankBit       = bitRead(a, 3);
       byte right_busyBit = bitRead(b, 6);
 
       std::string tray_status = (trayBit == 1) ? "Present" : "Missing";
-      std::string tank_status = (tankBit == 1) ? "Fill Tank" : "OK";
+      std::string tank_status = (tankBit == 0) ? "Fill Tank" : "OK";
       std::string machine_status = "Ready";
       if (trayBit == 0)       machine_status = "Tray Missing";
-      if (tankBit == 1)       machine_status = "Fill Tank";
+      if (tankBit == 0)       machine_status = "Fill Tank";
       if (right_busyBit == 1) machine_status = "Busy (Milk Drink)";
       if (left_readyBit == 0) machine_status = "Busy (Coffee Drink)";
 
