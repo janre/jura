@@ -158,6 +158,77 @@ See the [examples/](examples/) folder for complete button configurations for eac
 
 📖 **For a comprehensive list of known commands and discovery guidance, see [COMMANDS.md](COMMANDS.md)**
 
+### Non-blocking protocol and `send_command()`
+
+The component no longer blocks the ESPHome main loop. Commands are queued and sent one character per
+loop step (1 ms between the 4 UART bytes of a character, 8 ms between characters, 2 s response timeout),
+replies are only accepted if they match the command (`ic:` for `IC:`, `rr:` for `RR:`, `ok:` for `AN:`/`FA:`).
+
+`cmd2jura()` still works in lambdas but now only queues the command and returns an empty string.
+To get the reply, use `send_command()` with a callback:
+
+```yaml
+on_press:
+  - lambda: |-
+      id(jura_coffee).send_command("IC:", [](const std::string &r) {
+        ESP_LOGI("jura", "IC reply: %s", r.c_str());
+      });
+```
+
+Further options: `status_update_interval` (poll `IC:` separately from the `RT:` counters on `update_interval`),
+`ic_bits_ignore_mask` (hide constantly toggling bits from the `IC Bits` sensor), `watch:` (poll RAM words
+`RR:xx` as diagnostic sensors) and `start_ram_dump()` (log `RR:00`..`RR:FE` once, read-only).
+
+---
+
+## ☕ Impressa F50 (`model: F50`)
+
+Verified on an Impressa F50 reporting `ty:EPSI XL M V01.04` (2026-11), using RAM dumps before/after
+power on/off, descaling, cleaning and rinsing. Power and clock addresses match the findings of
+[opajonk/jura-f50-esphome](https://github.com/opajonk/jura-f50-esphome) (`ty:EPSILON MASK 11`).
+
+```yaml
+jura:
+  id: jura_main
+  uart_id: uart_bus
+  model: F50
+  update_interval: 60s          # RT:0000 counters
+  status_update_interval: 5s    # IC: flags
+  ic_bits_ignore_mask: 0x40     # byte A bit 6 toggles constantly
+  power:
+    name: "Power"
+  clock:
+    name: "Clock"
+  tap_open:
+    name: "Tap Open"
+  ready:
+    name: "Ready"
+  descale_needed:
+    name: "Descaling Needed"
+  clean_needed:
+    name: "Cleaning Needed"
+```
+
+| Source | Bit / field | Meaning on the F50 |
+|---|---|---|
+| `RR:44` | byte 0x44 | `00` = off, `01` = on (also bytes 0x1B, 0x54) |
+| `RR:BC` | bytes 0xBC/0xBD | clock, binary hours / minutes, `0000` = not set |
+| `RR:10` | byte 0x10 bit 6 | descaling needed (cleared by the descaling programme) |
+| `RR:10` | byte 0x10 bit 7 | cleaning needed (cleared by the cleaning programme) |
+| `RR:1C` | byte 0x1C | running maintenance programme: `00` none, `04` descaling, `02` cleaning |
+| `IC:` | byte A bit 5 | tap (steam / hot water) open |
+| `IC:` | byte A bit 4 | drip tray present |
+| `IC:` | byte A bit 3 | water tank OK (`0` = empty / missing) |
+| `IC:` | byte A bit 1 | heated (`0` while heating or waiting for the rinse key; also `1` while off) |
+| `IC:` | byte A bit 6 | toggles every few seconds, also while off; meaning unknown |
+| `RT:0000` | counter_9 / counter_16 | cleanings performed / since last cleaning (reset by cleaning) |
+| `RT:0000` | counter_10 / counter_14 | descalings performed / since last descaling (reset by descaling) |
+| `RT:0000` | counter_15 | grounds container, +1 per cup, +2 per double, 16 = full, reset when emptied (250 during maintenance programmes) |
+
+Not yet confirmed: a flag for "rinse needed" (candidates byte 0x52 bit 4 and byte 0x6C bit 6, set from
+the start of descaling until the final rinse). The other F7 counter labels (e.g. cappuccino) do not apply
+to the F50; `model: F50` keeps them for now so existing entities keep their names.
+
 ---
 
 ## 🥶 Jura CoolControl Component

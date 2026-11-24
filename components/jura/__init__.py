@@ -1,10 +1,18 @@
 DEPENDENCIES = ["uart"]
-AUTO_LOAD = ["sensor", "text_sensor"]
+AUTO_LOAD = ["binary_sensor", "sensor", "text_sensor"]
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import uart, sensor, text_sensor
-from esphome.const import CONF_ID, CONF_NAME, UNIT_EMPTY, ENTITY_CATEGORY_DIAGNOSTIC
+from esphome.components import binary_sensor, uart, sensor, text_sensor
+from esphome.const import (
+    CONF_ID,
+    CONF_NAME,
+    DEVICE_CLASS_OPENING,
+    DEVICE_CLASS_POWER,
+    DEVICE_CLASS_PROBLEM,
+    UNIT_EMPTY,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+)
 
 # Icons/units
 ICON_CUP = "mdi:cup"
@@ -25,7 +33,8 @@ MODEL_E6 = "E6"
 MODEL_E8 = "E8"
 MODEL_F6 = "F6"
 MODEL_F7 = "F7"
-MODEL_ENUM = cv.one_of(MODEL_E6, MODEL_E8, MODEL_F6, MODEL_F7, MODEL_UNKNOWN, upper=True)
+MODEL_F50 = "F50"
+MODEL_ENUM = cv.one_of(MODEL_E6, MODEL_E8, MODEL_F6, MODEL_F7, MODEL_F50, MODEL_UNKNOWN, upper=True)
 
 # YAML field keys (unique per entity, used only to anchor IDs)
 F_SINGLE_ESPRESSO       = "single_espresso_made"
@@ -54,6 +63,30 @@ F_MACHINE_STATUS        = "machine_status"
 
 F_COUNTERS_CHANGED      = "counters_changed"
 F_IC_BITS = "ic_bits"
+
+# Optional power binary sensor (polls RR:44, verified on Impressa F50 / EPSILON MASK 11 only)
+F_POWER = "power"
+CONF_POWER_UPDATE_INTERVAL = "power_update_interval"
+# Optional machine clock text sensor (polls RR:BC, verified on Impressa F50 / EPSILON MASK 11 only)
+F_CLOCK = "clock"
+CONF_CLOCK_UPDATE_INTERVAL = "clock_update_interval"
+# Diagnostic RAM watches (RR:xx polled regularly, published as number, changes logged)
+# Optional F50 binary sensors (observed on Impressa F50, ty:EPSI XL M V01.04)
+F_TAP_OPEN = "tap_open"              # IC: byte A bit 5
+F_READY = "ready"                    # IC: byte A bit 1
+F_DESCALE_NEEDED = "descale_needed"  # RR:10 bit 6
+F_CLEAN_NEEDED = "clean_needed"      # RR:10 bit 7
+CONF_MAINTENANCE_UPDATE_INTERVAL = "maintenance_update_interval"
+# Optional separate interval for the IC: status flags (default: together with RT: on update_interval)
+CONF_STATUS_UPDATE_INTERVAL = "status_update_interval"
+# Bits of IC: byte A hidden from the "IC Bits" diagnostic sensor (e.g. 0x40 for a constantly toggling bit)
+CONF_IC_BITS_IGNORE_MASK = "ic_bits_ignore_mask"
+CONF_WATCH = "watch"
+CONF_WATCH_INTERVAL = "watch_interval"
+CONF_ADDRESS = "address"
+WATCH_SCHEMA = sensor.sensor_schema(
+    icon="mdi:memory", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC
+).extend({cv.Required(CONF_ADDRESS): cv.hex_uint8_t})
 
 # C++ binding
 jura_ns = cg.esphome_ns.namespace("jura")
@@ -114,6 +147,27 @@ CONFIG_SCHEMA = cv.Schema({
         text_sensor.text_sensor_schema(icon="mdi:format-list-bulleted",entity_category=ENTITY_CATEGORY_DIAGNOSTIC),    
     cv.Optional(F_IC_BITS, default={CONF_NAME: "IC Bits"}):
         text_sensor.text_sensor_schema(icon="mdi:binary",entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    # Power state: no default, because RR:44 is only verified on the F50.
+    cv.Optional(F_POWER):
+        binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_POWER, icon=ICON_COFFEE_MAKER),
+    cv.Optional(CONF_POWER_UPDATE_INTERVAL, default="10s"): cv.positive_time_period_milliseconds,
+    # Machine clock (HH:MM, "--:--" if unset): no default, only verified on the F50.
+    cv.Optional(F_CLOCK):
+        text_sensor.text_sensor_schema(icon="mdi:clock-outline"),
+    cv.Optional(CONF_CLOCK_UPDATE_INTERVAL, default="30s"): cv.positive_time_period_milliseconds,
+    cv.Optional(F_TAP_OPEN):
+        binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_OPENING, icon="mdi:water-pump"),
+    cv.Optional(F_READY):
+        binary_sensor.binary_sensor_schema(icon="mdi:coffee-maker-check"),
+    cv.Optional(F_DESCALE_NEEDED):
+        binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_PROBLEM, icon="mdi:water-alert"),
+    cv.Optional(F_CLEAN_NEEDED):
+        binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_PROBLEM, icon="mdi:spray-bottle"),
+    cv.Optional(CONF_MAINTENANCE_UPDATE_INTERVAL, default="60s"): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_STATUS_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_IC_BITS_IGNORE_MASK, default=0): cv.hex_uint8_t,
+    cv.Optional(CONF_WATCH): cv.ensure_list(WATCH_SCHEMA),
+    cv.Optional(CONF_WATCH_INTERVAL, default="5s"): cv.positive_time_period_milliseconds,
 }).extend(uart.UART_DEVICE_SCHEMA).extend(cv.polling_component_schema("2s"))
 
 # ---------- MODEL → which fields to expose & which publish keys they map to ----------
@@ -224,6 +278,12 @@ MODEL_MAP = {
     },
 }
 
+# Impressa F50: same RT:0000 layout as the F7 entry for now, so existing entities keep their names.
+# Verified on the F50: counter_10 = descalings, counter_14 = since last descaling (reset to 0 by the
+# descaling programme), counter_15 = grounds (reset when emptied, 16 = full). Other labels unverified.
+MODEL_MAP["F50"] = MODEL_MAP["F7"]
+
+
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -242,6 +302,39 @@ async def to_code(config):
     for field_key, publish_key in spec.get("text", []):
         ts = await text_sensor.new_text_sensor(config[field_key])
         cg.add(var.register_text_sensor(cg.std_string(publish_key), ts))
+
+    if F_POWER in config:
+        bs = await binary_sensor.new_binary_sensor(config[F_POWER])
+        cg.add(var.set_power_sensor(bs))
+        cg.add(var.set_power_interval(config[CONF_POWER_UPDATE_INTERVAL]))
+
+    if F_CLOCK in config:
+        ts = await text_sensor.new_text_sensor(config[F_CLOCK])
+        cg.add(var.set_clock_sensor(ts))
+        cg.add(var.set_clock_interval(config[CONF_CLOCK_UPDATE_INTERVAL]))
+
+    if CONF_STATUS_UPDATE_INTERVAL in config:
+        cg.add(var.set_status_interval(config[CONF_STATUS_UPDATE_INTERVAL]))
+    if config[CONF_IC_BITS_IGNORE_MASK]:
+        cg.add(var.set_ic_bits_ignore_mask(config[CONF_IC_BITS_IGNORE_MASK]))
+
+    for key, setter in (
+        (F_TAP_OPEN, var.set_tap_open_sensor),
+        (F_READY, var.set_ready_sensor),
+        (F_DESCALE_NEEDED, var.set_descale_needed_sensor),
+        (F_CLEAN_NEEDED, var.set_clean_needed_sensor),
+    ):
+        if key in config:
+            bs = await binary_sensor.new_binary_sensor(config[key])
+            cg.add(setter(bs))
+    if F_DESCALE_NEEDED in config or F_CLEAN_NEEDED in config:
+        cg.add(var.set_maintenance_interval(config[CONF_MAINTENANCE_UPDATE_INTERVAL]))
+
+    for w in config.get(CONF_WATCH, []):
+        s = await sensor.new_sensor(w)
+        cg.add(var.add_watch(w[CONF_ADDRESS], s))
+    if CONF_WATCH in config:
+        cg.add(var.set_watch_interval(config[CONF_WATCH_INTERVAL]))
 
 
 
