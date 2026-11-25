@@ -217,6 +217,21 @@ jura:
 `Heating`, `Rinse Needed`, `Not Ready`, `Ready`. After power on the machine shows `Heating`, then
 `Rinse Needed` until the rinse key is pressed, then `Ready`.
 
+On/off switch with immediate feedback (needs `power`): `set_power()` sends `AN:01` / `AN:02` and then polls
+`RR:44` every 0.5 s until the machine confirms. `power_switch_state()` shows the requested state at once and
+falls back to the real state if the machine does not confirm within 10 s.
+
+```yaml
+switch:
+  - platform: template
+    name: "Machine"
+    lambda: return id(jura_main).power_switch_state();
+    turn_on_action:
+      - lambda: id(jura_main).set_power(true);
+    turn_off_action:
+      - lambda: id(jura_main).set_power(false);
+```
+
 | Source | Bit / field | Meaning on the F50 |
 |---|---|---|
 | `RR:44` | byte 0x44 | `00` = off, `01` = on (also bytes 0x1B, 0x54) |

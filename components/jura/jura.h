@@ -52,6 +52,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   static constexpr uint32_t RX_FRAME_GAP_US = 20000;
   // Consecutive failed power polls before the power state is reported as unknown.
   static constexpr uint8_t POWER_MAX_FAILURES = 5;
+  // After set_power(): poll RR:44 this often (front of the queue) until the machine confirms the new state,
+  // and show the requested state in power_switch_state() for at most POWER_CONFIRM_MS.
+  static constexpr uint32_t POWER_FAST_POLL_MS = 500;
+  static constexpr uint32_t POWER_CONFIRM_MS = 10000;
 
   void set_model(const std::string &m) { model_ = m; }
 
@@ -120,6 +124,29 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   void request_power_update() {
     if (power_sensor_ != nullptr)
       poll_power_();
+  }
+
+  // Switch the machine on (AN:01) or off (AN:02), for a template switch:
+  //   switch:
+  //     - platform: template
+  //       lambda: return id(jura_main).power_switch_state();
+  //       turn_on_action:  - lambda: id(jura_main).set_power(true);
+  //       turn_off_action: - lambda: id(jura_main).set_power(false);
+  // power_switch_state() reports the requested state at once (no bouncing back in the UI). RR:44 is then
+  // polled every POWER_FAST_POLL_MS until the machine confirms it; after POWER_CONFIRM_MS without
+  // confirmation the switch shows the real power state again.
+  void set_power(bool on) {
+    power_target_ = on;
+    power_target_active_ = true;
+    power_target_since_ms_ = millis();
+    send_command(on ? "AN:01" : "AN:02", [this](const std::string &) { fast_power_poll_(); });
+  }
+  optional<bool> power_switch_state() const {
+    if (power_target_active_)
+      return power_target_;
+    if (power_sensor_ == nullptr || !power_known_)
+      return {};
+    return power_on_;
   }
 
   float get_setup_priority() const override { return setup_priority::DATA; }
@@ -385,25 +412,55 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     return true;
   }
 
-  void poll_power_() {
-    if (power_pending_)
+  // fast = true: after set_power(), at the front of the queue and independent of the regular poll.
+  void poll_power_(bool fast = false) {
+    bool &pending = fast ? power_fast_pending_ : power_pending_;
+    if (pending)
       return;
-    power_pending_ = true;
-    enqueue_("RR:44", [this](const std::string &r) {
-      power_pending_ = false;
-      if (r.size() == 7 && is_valid_reply_(r, "rr:", 7)) {
-        power_failures_ = 0;
-        power_on_ = (r[3] != '0' || r[4] != '0');
-        power_known_ = true;
-        power_sensor_->publish_state(power_on_);
-        return;
+    pending = true;
+    enqueue_(
+        "RR:44",
+        [this, fast](const std::string &r) {
+          (fast ? power_fast_pending_ : power_pending_) = false;
+          handle_power_(r);
+        },
+        /*front=*/fast);
+  }
+
+  void handle_power_(const std::string &r) {
+    if (r.size() == 7 && is_valid_reply_(r, "rr:", 7)) {
+      power_failures_ = 0;
+      power_on_ = (r[3] != '0' || r[4] != '0');
+      power_known_ = true;
+      if (power_target_active_ && power_on_ == power_target_) {
+        power_target_active_ = false;
+        cancel_timeout("power_fast");
+        ESP_LOGI(TAG, "Power %s confirmed after %u ms", power_on_ ? "on" : "off",
+                 (unsigned) (millis() - power_target_since_ms_));
       }
-      ESP_LOGW(TAG, "Unexpected RR:44 response '%s'", r.c_str());
-      if (power_failures_ < POWER_MAX_FAILURES && ++power_failures_ == POWER_MAX_FAILURES) {
-        power_known_ = false;
-        power_sensor_->invalidate_state();
-      }
-    });
+      power_sensor_->publish_state(power_on_);
+      return;
+    }
+    ESP_LOGW(TAG, "Unexpected RR:44 response '%s'", r.c_str());
+    if (power_failures_ < POWER_MAX_FAILURES && ++power_failures_ == POWER_MAX_FAILURES) {
+      power_known_ = false;
+      power_sensor_->invalidate_state();
+    }
+  }
+
+  // Poll RR:44 every POWER_FAST_POLL_MS until handle_power_() sees the requested state or time runs out.
+  void fast_power_poll_() {
+    if (!power_target_active_)
+      return;
+    if ((millis() - power_target_since_ms_) > POWER_CONFIRM_MS) {
+      power_target_active_ = false;
+      ESP_LOGW(TAG, "Machine did not confirm power %s within %u ms", power_target_ ? "on" : "off",
+               (unsigned) POWER_CONFIRM_MS);
+      return;
+    }
+    if (power_sensor_ != nullptr)
+      poll_power_(/*fast=*/true);
+    set_timeout("power_fast", POWER_FAST_POLL_MS, [this]() { fast_power_poll_(); });
   }
 
   struct Watch {
@@ -766,6 +823,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   bool power_on_{false};
   bool power_known_{false};
   uint8_t power_failures_{0};
+  bool power_fast_pending_{false};
+  bool power_target_{false};
+  bool power_target_active_{false};
+  uint32_t power_target_since_ms_{0};
 
   binary_sensor::BinarySensor *tap_open_sensor_{nullptr};
   binary_sensor::BinarySensor *ready_sensor_{nullptr};
