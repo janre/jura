@@ -207,9 +207,8 @@ jura:
     name: "Descaling Needed"
   clean_needed:
     name: "Cleaning Needed"
-  startup_rinse:                # candidate, see below
-    name: "Startup Rinse (candidate 30.7)"
-    entity_category: diagnostic
+  startup_rinse:                # rinse prompt after power on
+    name: "Rinse Needed"
 ```
 
 | Source | Bit / field | Meaning on the F50 |
@@ -219,7 +218,7 @@ jura:
 | `RR:10` | byte 0x10 bit 6 | descaling needed (cleared by the descaling programme) |
 | `RR:10` | byte 0x10 bit 7 | cleaning needed (cleared by the cleaning programme) |
 | `RR:1C` | byte 0x1C | running maintenance programme: `00` none, `04` descaling, `02` cleaning |
-| `RR:30` | byte 0x30 bit 7 | **candidate:** startup rinse prompt ("press care key" after power on); not set for the rinse at the end of descaling |
+| `RR:30` | byte 0x30 bit 7 | startup rinse prompt ("press care key" after power on); not set for the rinse at the end of descaling |
 | `IC:` | byte A bit 5 | tap (steam / hot water) open |
 | `IC:` | byte A bit 4 | drip tray present |
 | `IC:` | byte A bit 3 | water tank OK (`0` = empty / missing) |
@@ -229,10 +228,11 @@ jura:
 | `RT:0000` | counter_10 / counter_14 | descalings performed / since last descaling (reset by descaling) |
 | `RT:0000` | counter_15 | grounds container, +1 per cup, +2 per double, 16 = full, reset when emptied (250 during maintenance programmes) |
 
-Rinse prompt: byte 0x30 bit 7 was set in both controlled startup rinse prompts (2026-11-24 and
-2026-11-25) and 0 after rinsing and in ~30 other recorded states (off, ready, maintenance programmes).
-It was **not** set for the rinse prompt at the end of the descaling programme, so that case is still
-unknown. Ruled out as rinse indicators: byte 0x1D bit 3 (also set while the display shows "ready"),
+Rinse prompt: byte 0x30 bit 7 was set in three startup rinse prompts (dumps 2026-11-24 and 2026-11-25,
+and live in Home Assistant on 2026-11-25) and 0 after rinsing and in ~30 other recorded states (off,
+ready, maintenance programmes). With `startup_rinse` configured, `Machine Status` shows `Rinse Needed`
+and `ready` is off while it is set. It was **not** set for the rinse prompt at the end of the descaling
+programme, so that case is still unknown. Ruled out as rinse indicators: byte 0x1D bit 3 (also set while the display shows "ready"),
 byte 0x52 bit 4 and byte 0x6C bit 6 (only set during descaling).
 
 Read commands on this firmware: `TY:`, `IC:`, `RR:xx`, `RE:xxxx`, `RT:xxxx` (16 words, e.g. `RT:0010`),

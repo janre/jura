@@ -70,10 +70,11 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   void set_descale_needed_sensor(binary_sensor::BinarySensor *s) { descale_needed_sensor_ = s; }
   void set_clean_needed_sensor(binary_sensor::BinarySensor *s) { clean_needed_sensor_ = s; }
   void set_maintenance_interval(uint32_t ms) { maintenance_interval_ms_ = ms; }
-  // Candidate for the startup rinse prompt ("Pflege druecken" after power on): RAM byte 0x30 bit 7,
-  // i.e. RR:30 word & 0x8000, on the Impressa F50 (ty:EPSI XL M V01.04). Set in both controlled startup
-  // rinse prompts (2026-11-24, 2026-11-25), 0 after rinsing and in all other recorded states.
-  // NOT set for the rinse prompt at the end of the descaling programme. Reported only while on.
+  // Startup rinse prompt ("Pflege druecken" after power on): RAM byte 0x30 bit 7, i.e. RR:30 word & 0x8000,
+  // on the Impressa F50 (ty:EPSI XL M V01.04). Confirmed three times (dumps 2026-11-24/25 and live in HA):
+  // set while the prompt is shown, 0 after rinsing and in all other recorded states. NOT set for the rinse
+  // prompt at the end of the descaling programme. Reported only while on; sets the status "Rinse Needed"
+  // and clears "ready".
   void set_startup_rinse_sensor(binary_sensor::BinarySensor *s) { startup_rinse_sensor_ = s; }
 
   // Machine clock from RAM bytes 0xBC/0xBD (RR:BC): binary hours and minutes. Read-only.
@@ -484,8 +485,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
         return;  // keep the last valid state
       }
       const uint8_t b30 = static_cast<uint8_t>(strtoul(r.substr(3, 2).c_str(), nullptr, 16));
+      rinse_needed_ = (b30 >> 7) & 1;
+      rinse_known_ = true;
       const bool known_off = power_sensor_ != nullptr && power_known_ && !power_on_;
-      startup_rinse_sensor_->publish_state(((b30 >> 7) & 1) && !known_off);
+      startup_rinse_sensor_->publish_state(rinse_needed_ && !known_off);
     });
   }
 
@@ -567,16 +570,19 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     // Bit 1 is also set while the machine is off, so "ready" additionally requires power on.
     const bool heated = (a >> 1) & 1;
     const bool known_off = power_sensor_ != nullptr && power_known_ && !power_on_;
+    const bool rinse = startup_rinse_sensor_ != nullptr && rinse_known_ && rinse_needed_;
     if (tap_open_sensor_ != nullptr)
       tap_open_sensor_->publish_state(tap_open);
     if (ready_sensor_ != nullptr)
-      ready_sensor_->publish_state(heated && !known_off);
+      ready_sensor_->publish_state(heated && !known_off && !rinse);
 
     std::string machine_status = "Ready";
     if (model_ == "F50") {
       // Impressa F50: highest priority last.
       if (!heated)
         machine_status = "Not Ready";  // heating up
+      if (rinse)
+        machine_status = "Rinse Needed";  // startup rinse prompt
       if (tap_open)
         machine_status = "Tap Open";
       if (!tank_ok)
@@ -731,6 +737,8 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   binary_sensor::BinarySensor *clean_needed_sensor_{nullptr};
   binary_sensor::BinarySensor *startup_rinse_sensor_{nullptr};
   bool rinse_pending_{false};
+  bool rinse_needed_{false};
+  bool rinse_known_{false};
   uint32_t maintenance_interval_ms_{60000};
   bool maintenance_pending_{false};
 
