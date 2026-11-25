@@ -43,6 +43,8 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   static constexpr uint32_t RESPONSE_TIMEOUT_MS = 2000;
   // Pause between the end of one transaction and the start of the next one.
   static constexpr uint32_t INTER_COMMAND_MS = 20;
+  // Quiet period after a timeout in which late replies are discarded (see loop(), State::IDLE).
+  static constexpr uint32_t LATE_REPLY_DRAIN_MS = 2000;
   // Guard against a runaway RX stream (longest known response, RT:0000, is ~67 characters).
   static constexpr size_t MAX_RESPONSE_LEN = 256;
   static constexpr size_t MAX_QUEUE_LEN = 8;
@@ -68,6 +70,11 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   void set_descale_needed_sensor(binary_sensor::BinarySensor *s) { descale_needed_sensor_ = s; }
   void set_clean_needed_sensor(binary_sensor::BinarySensor *s) { clean_needed_sensor_ = s; }
   void set_maintenance_interval(uint32_t ms) { maintenance_interval_ms_ = ms; }
+  // Candidate for the startup rinse prompt ("Pflege druecken" after power on): RAM byte 0x30 bit 7,
+  // i.e. RR:30 word & 0x8000, on the Impressa F50 (ty:EPSI XL M V01.04). Set in both controlled startup
+  // rinse prompts (2026-11-24, 2026-11-25), 0 after rinsing and in all other recorded states.
+  // NOT set for the rinse prompt at the end of the descaling programme. Reported only while on.
+  void set_startup_rinse_sensor(binary_sensor::BinarySensor *s) { startup_rinse_sensor_ = s; }
 
   // Machine clock from RAM bytes 0xBC/0xBD (RR:BC): binary hours and minutes. Read-only.
   // Verified on the Impressa F50 (ty:EPSILON MASK 11), see github.com/opajonk/jura-f50-esphome.
@@ -84,6 +91,7 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     }
     dump_active_ = true;
     dump_addr_ = 0;
+    dump_retry_ = 0;
     ESP_LOGI(DUMP_TAG, "DUMP start uptime=%u", (unsigned) (millis() / 1000));
     enqueue_("TY:", [this](const std::string &r) {
       ESP_LOGI(DUMP_TAG, "DUMP TY:=%s", r.empty() ? "????" : r.c_str());
@@ -126,6 +134,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
       set_interval("maintenance", maintenance_interval_ms_, [this]() { poll_maintenance_(); });
       poll_maintenance_();
     }
+    if (startup_rinse_sensor_ != nullptr) {
+      set_interval("rinse", status_interval_ms_ > 0 ? status_interval_ms_ : 5000, [this]() { poll_rinse_(); });
+      poll_rinse_();
+    }
   }
 
   // Queue a command for the machine. The optional callback receives the response
@@ -160,6 +172,19 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     const uint32_t now_ms = millis();
     switch (state_) {
       case State::IDLE: {
+        // After a timeout, discard everything that still arrives for a while: RR: replies carry no address
+        // ("rr:0121"), so a late reply would otherwise be taken as the reply to the next RR: command.
+        if (drain_until_ms_ != 0) {
+          uint8_t junk;
+          while (available() && read_byte(&junk))
+            drained_bytes_++;
+          if ((int32_t) (now_ms - drain_until_ms_) < 0)
+            return;
+          if (drained_bytes_ > 0)
+            ESP_LOGD(TAG, "Discarded %u late bytes after timeout", (unsigned) drained_bytes_);
+          drain_until_ms_ = 0;
+          drained_bytes_ = 0;
+        }
         if (queue_.empty() || (now_ms - last_done_ms_) < INTER_COMMAND_MS)
           return;
         current_ = std::move(queue_.front());
@@ -321,6 +346,11 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     high_freq_.stop();
     state_ = State::IDLE;
     last_done_ms_ = millis();
+    if (!ok) {
+      drain_until_ms_ = last_done_ms_ + LATE_REPLY_DRAIN_MS;
+      if (drain_until_ms_ == 0)
+        drain_until_ms_ = 1;
+    }
     Command done = std::move(current_);
     current_ = Command{};
     ESP_LOGV(TAG, "'%s' -> '%s'", done.cmd.c_str(), ok ? rx_buf_.c_str() : "<timeout>");
@@ -409,7 +439,14 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     const std::string c(cmd);
     enqueue_(c, [this, c](const std::string &r) {
       const bool ok = r.size() == 7 && is_valid_reply_(r, "rr:", 7);
+      // Retry a missing/garbled read up to DUMP_MAX_RETRIES times, so a dump has no gaps that could hide a flag.
+      if (!ok && dump_retry_ < DUMP_MAX_RETRIES) {
+        dump_retry_++;
+        dump_next_();
+        return;
+      }
       ESP_LOGI(DUMP_TAG, "DUMP %s=%s", c.c_str(), ok ? r.c_str() + 3 : "????");
+      dump_retry_ = 0;
       dump_addr_ += 2;
       dump_next_();
     });
@@ -433,6 +470,22 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     enqueue_("IC:", [this](const std::string &r) {
       ic_pending_ = false;
       handle_ic_(r);
+    });
+  }
+
+  void poll_rinse_() {
+    if (rinse_pending_)
+      return;
+    rinse_pending_ = true;
+    enqueue_("RR:30", [this](const std::string &r) {
+      rinse_pending_ = false;
+      if (r.size() != 7 || !is_valid_reply_(r, "rr:", 7)) {
+        ESP_LOGW(TAG, "Unexpected RR:30 response '%s'", r.c_str());
+        return;  // keep the last valid state
+      }
+      const uint8_t b30 = static_cast<uint8_t>(strtoul(r.substr(3, 2).c_str(), nullptr, 16));
+      const bool known_off = power_sensor_ != nullptr && power_known_ && !power_on_;
+      startup_rinse_sensor_->publish_state(((b30 >> 7) & 1) && !known_off);
     });
   }
 
@@ -523,7 +576,7 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     if (model_ == "F50") {
       // Impressa F50: highest priority last.
       if (!heated)
-        machine_status = "Not Ready";  // heating up, or waiting for the rinse key
+        machine_status = "Not Ready";  // heating up
       if (tap_open)
         machine_status = "Tap Open";
       if (!tank_ok)
@@ -657,6 +710,8 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   uint32_t rx_last_us_{0};
   uint32_t rx_start_ms_{0};
   uint32_t last_done_ms_{0};
+  uint32_t drain_until_ms_{0};
+  uint32_t drained_bytes_{0};
   bool rt_pending_{false};
   bool ic_pending_{false};
   uint32_t status_interval_ms_{0};
@@ -674,6 +729,8 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   binary_sensor::BinarySensor *ready_sensor_{nullptr};
   binary_sensor::BinarySensor *descale_needed_sensor_{nullptr};
   binary_sensor::BinarySensor *clean_needed_sensor_{nullptr};
+  binary_sensor::BinarySensor *startup_rinse_sensor_{nullptr};
+  bool rinse_pending_{false};
   uint32_t maintenance_interval_ms_{60000};
   bool maintenance_pending_{false};
 
@@ -681,8 +738,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   uint32_t clock_interval_ms_{30000};
   bool clock_pending_{false};
 
+  static constexpr uint8_t DUMP_MAX_RETRIES = 2;
   bool dump_active_{false};
   uint16_t dump_addr_{0};
+  uint8_t dump_retry_{0};
 
   std::vector<Watch> watches_;
   uint32_t watch_interval_ms_{5000};
