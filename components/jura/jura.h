@@ -430,7 +430,9 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   void handle_power_(const std::string &r) {
     if (r.size() == 7 && is_valid_reply_(r, "rr:", 7)) {
       power_failures_ = 0;
-      power_on_ = (r[3] != '0' || r[4] != '0');
+      const bool on = (r[3] != '0' || r[4] != '0');
+      const bool changed = !power_known_ || on != power_on_;
+      power_on_ = on;
       power_known_ = true;
       if (power_target_active_ && power_on_ == power_target_) {
         power_target_active_ = false;
@@ -439,6 +441,8 @@ class Jura : public PollingComponent, public uart::UARTDevice {
                  (unsigned) (millis() - power_target_since_ms_));
       }
       power_sensor_->publish_state(power_on_);
+      if (changed)
+        on_power_changed_();
       return;
     }
     ESP_LOGW(TAG, "Unexpected RR:44 response '%s'", r.c_str());
@@ -446,6 +450,21 @@ class Jura : public PollingComponent, public uart::UARTDevice {
       power_known_ = false;
       power_sensor_->invalidate_state();
     }
+  }
+
+  // The sensors that depend on power would otherwise follow only with their own polls (up to the status
+  // interval). Republish them from the last values at once (all off when switched off), then read
+  // RR:30, RR:04 and IC: again right away, in this order, so "ready" and the status use fresh values.
+  void on_power_changed_() {
+    if (heated_sensor_ != nullptr && heat_known_)
+      heated_sensor_->publish_state(at_temp_ && power_on_);
+    if (startup_rinse_sensor_ != nullptr && rinse_known_)
+      startup_rinse_sensor_->publish_state(rinse_needed_ && power_on_);
+    if (startup_rinse_sensor_ != nullptr)
+      poll_rinse_();
+    if (heated_sensor_ != nullptr)
+      poll_heat_();
+    poll_ic_();
   }
 
   // Poll RR:44 every POWER_FAST_POLL_MS until handle_power_() sees the requested state or time runs out.
