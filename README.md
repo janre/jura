@@ -209,12 +209,19 @@ jura:
     name: "Cleaning Needed"
   startup_rinse:                # rinse prompt after power on
     name: "Rinse Needed"
+  heated:                       # operating temperature reached
+    name: "Heated"
 ```
+
+`Machine Status` on the F50, highest priority first: `Off`, `Tray Missing`, `Fill Tank`, `Tap Open`,
+`Heating`, `Rinse Needed`, `Not Ready`, `Ready`. After power on the machine shows `Heating`, then
+`Rinse Needed` until the rinse key is pressed, then `Ready`.
 
 | Source | Bit / field | Meaning on the F50 |
 |---|---|---|
 | `RR:44` | byte 0x44 | `00` = off, `01` = on (also bytes 0x1B, 0x54) |
 | `RR:BC` | bytes 0xBC/0xBD | clock, binary hours / minutes, `0000` = not set |
+| `RR:04` | byte 0x04 bit 2 | operating temperature reached (`0` while heating and during descaling; stays `1` for some minutes after power off) |
 | `RR:10` | byte 0x10 bit 6 | descaling needed (cleared by the descaling programme) |
 | `RR:10` | byte 0x10 bit 7 | cleaning needed (cleared by the cleaning programme) |
 | `RR:1C` | byte 0x1C | running maintenance programme: `00` none, `04` descaling, `02` cleaning |
@@ -222,7 +229,7 @@ jura:
 | `IC:` | byte A bit 5 | tap (steam / hot water) open |
 | `IC:` | byte A bit 4 | drip tray present |
 | `IC:` | byte A bit 3 | water tank OK (`0` = empty / missing) |
-| `IC:` | byte A bit 1 | heated (`0` while heating or waiting for the rinse key; also `1` while off) |
+| `IC:` | byte A bit 1 | `0` in parts of maintenance programmes (e.g. end of descaling); `1` when ready and while off; not a heating flag |
 | `IC:` | byte A bit 6 | toggles every few seconds, also while off; meaning unknown |
 | `RT:0000` | counter_9 / counter_16 | cleanings performed / since last cleaning (reset by cleaning) |
 | `RT:0000` | counter_10 / counter_14 | descalings performed / since last descaling (reset by descaling) |
@@ -233,7 +240,15 @@ and live in Home Assistant on 2026-11-25) and 0 after rinsing and in ~30 other r
 ready, maintenance programmes). With `startup_rinse` configured, `Machine Status` shows `Rinse Needed`
 and `ready` is off while it is set. It was **not** set for the rinse prompt at the end of the descaling
 programme, so that case is still unknown. Ruled out as rinse indicators: byte 0x1D bit 3 (also set while the display shows "ready"),
-byte 0x52 bit 4 and byte 0x6C bit 6 (only set during descaling).
+byte 0x52 bit 4 and byte 0x6C bit 6 (only set during descaling). The rinse bit is already set while the
+machine heats after power on, so `Heating` takes priority over `Rinse Needed`.
+
+Heated: byte 0x04 bit 2 is the same bit that
+[SkyFox277/esphome-jura](https://github.com/SkyFox277/esphome-jura) reads as `RR:03 & 0x0004`
+("operating temperature reached", about 40 s after a cold start there). In our dumps it was `0` while
+heating at the end of descaling and during the descaling programme, and `1` at every rinse prompt and every
+confirmed "ready". It stays set for some minutes after power off (still warm), so `heated` is reported
+only while the machine is on.
 
 Read commands on this firmware: `TY:`, `IC:`, `RR:xx`, `RE:xxxx`, `RT:xxxx` (16 words, e.g. `RT:0010`),
 `CS:` (8 bytes, last 6 = `AS:`) and `AS:` answer; `HZ:` and `TL:` do not. EEPROM words `0007`, `000D`,

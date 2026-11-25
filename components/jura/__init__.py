@@ -73,10 +73,11 @@ CONF_CLOCK_UPDATE_INTERVAL = "clock_update_interval"
 # Diagnostic RAM watches (RR:xx polled regularly, published as number, changes logged)
 # Optional F50 binary sensors (observed on Impressa F50, ty:EPSI XL M V01.04)
 F_TAP_OPEN = "tap_open"              # IC: byte A bit 5
-F_READY = "ready"                    # IC: byte A bit 1
+F_READY = "ready"                    # IC: byte A bit 1, plus heated / startup_rinse if configured
 F_DESCALE_NEEDED = "descale_needed"  # RR:10 bit 6
 F_CLEAN_NEEDED = "clean_needed"      # RR:10 bit 7
-F_STARTUP_RINSE = "startup_rinse"    # RR:30, byte 0x30 bit 7 (candidate: startup rinse prompt)
+F_STARTUP_RINSE = "startup_rinse"    # RR:30, byte 0x30 bit 7 (startup rinse prompt)
+F_HEATED = "heated"                  # RR:04, byte 0x04 bit 2 (operating temperature reached)
 CONF_MAINTENANCE_UPDATE_INTERVAL = "maintenance_update_interval"
 # Optional separate interval for the IC: status flags (default: together with RT: on update_interval)
 CONF_STATUS_UPDATE_INTERVAL = "status_update_interval"
@@ -166,6 +167,8 @@ CONFIG_SCHEMA = cv.Schema({
         binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_PROBLEM, icon="mdi:spray-bottle"),
     cv.Optional(F_STARTUP_RINSE):
         binary_sensor.binary_sensor_schema(icon="mdi:water-sync"),
+    cv.Optional(F_HEATED):
+        binary_sensor.binary_sensor_schema(icon="mdi:thermometer-check"),
     cv.Optional(CONF_MAINTENANCE_UPDATE_INTERVAL, default="60s"): cv.positive_time_period_milliseconds,
     cv.Optional(CONF_STATUS_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
     cv.Optional(CONF_IC_BITS_IGNORE_MASK, default=0): cv.hex_uint8_t,
@@ -327,6 +330,7 @@ async def to_code(config):
         (F_DESCALE_NEEDED, var.set_descale_needed_sensor),
         (F_CLEAN_NEEDED, var.set_clean_needed_sensor),
         (F_STARTUP_RINSE, var.set_startup_rinse_sensor),
+        (F_HEATED, var.set_heated_sensor),
     ):
         if key in config:
             bs = await binary_sensor.new_binary_sensor(config[key])

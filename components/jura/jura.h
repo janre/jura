@@ -62,7 +62,9 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   void set_power_sensor(binary_sensor::BinarySensor *s) { power_sensor_ = s; }
   void set_power_interval(uint32_t ms) { power_interval_ms_ = ms; }
   // IC: flags observed on the Impressa F50 (ty:EPSI XL M V01.04): byte A bit 5 = tap (steam/hot water)
-  // open, byte A bit 1 = heated / ready (0 while heating or waiting for the rinse key).
+  // open, byte A bit 1 = 0 in parts of maintenance programmes (e.g. heating and rinse prompt at the end of
+  // descaling), 1 when ready and while off.
+  // It stayed 1 while heating after power on, so it is not a heating flag (see set_heated_sensor()).
   void set_tap_open_sensor(binary_sensor::BinarySensor *s) { tap_open_sensor_ = s; }
   void set_ready_sensor(binary_sensor::BinarySensor *s) { ready_sensor_ = s; }
   // Maintenance flags in RAM byte 0x10 (RR:10), observed on the Impressa F50 (ty:EPSI XL M V01.04):
@@ -76,6 +78,12 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   // prompt at the end of the descaling programme. Reported only while on; sets the status "Rinse Needed"
   // and clears "ready".
   void set_startup_rinse_sensor(binary_sensor::BinarySensor *s) { startup_rinse_sensor_ = s; }
+  // Heated (operating temperature reached): RAM byte 0x04 bit 2, i.e. RR:04 word & 0x0400 (the same bit as
+  // RR:03 & 0x0004 in github.com/SkyFox277/esphome-jura). On the Impressa F50 (ty:EPSI XL M V01.04): 0 while
+  // heating after power on and during descaling, 1 at the rinse prompt and when ready. It stays set for some
+  // minutes after power off while the machine is warm, so it is reported only while on. While it is 0 the
+  // status is "Heating" and "ready" is off.
+  void set_heated_sensor(binary_sensor::BinarySensor *s) { heated_sensor_ = s; }
 
   // Machine clock from RAM bytes 0xBC/0xBD (RR:BC): binary hours and minutes. Read-only.
   // Verified on the Impressa F50 (ty:EPSILON MASK 11), see github.com/opajonk/jura-f50-esphome.
@@ -138,6 +146,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     if (startup_rinse_sensor_ != nullptr) {
       set_interval("rinse", status_interval_ms_ > 0 ? status_interval_ms_ : 5000, [this]() { poll_rinse_(); });
       poll_rinse_();
+    }
+    if (heated_sensor_ != nullptr) {
+      set_interval("heat", status_interval_ms_ > 0 ? status_interval_ms_ : 5000, [this]() { poll_heat_(); });
+      poll_heat_();
     }
   }
 
@@ -492,6 +504,24 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     });
   }
 
+  void poll_heat_() {
+    if (heat_pending_)
+      return;
+    heat_pending_ = true;
+    enqueue_("RR:04", [this](const std::string &r) {
+      heat_pending_ = false;
+      if (r.size() != 7 || !is_valid_reply_(r, "rr:", 7)) {
+        ESP_LOGW(TAG, "Unexpected RR:04 response '%s'", r.c_str());
+        return;  // keep the last valid state
+      }
+      const uint8_t b04 = static_cast<uint8_t>(strtoul(r.substr(3, 2).c_str(), nullptr, 16));
+      at_temp_ = (b04 >> 2) & 1;
+      heat_known_ = true;
+      const bool known_off = power_sensor_ != nullptr && power_known_ && !power_on_;
+      heated_sensor_->publish_state(at_temp_ && !known_off);
+    });
+  }
+
   void poll_maintenance_() {
     if (maintenance_pending_)
       return;
@@ -567,22 +597,28 @@ class Jura : public PollingComponent, public uart::UARTDevice {
     const bool right_busy = (b >> 6) & 1;
 
     const bool tap_open = (a >> 5) & 1;
-    // Bit 1 is also set while the machine is off, so "ready" additionally requires power on.
-    const bool heated = (a >> 1) & 1;
+    // A bit 1 is 0 while a programme runs and also 1 while off, so "ready" additionally requires power on.
+    const bool ic_idle = (a >> 1) & 1;
     const bool known_off = power_sensor_ != nullptr && power_known_ && !power_on_;
     const bool rinse = startup_rinse_sensor_ != nullptr && rinse_known_ && rinse_needed_;
+    // With the heated sensor (RR:04), "ready" also needs the operating temperature; until the first
+    // valid RR:04 reply it is treated as not reached.
+    const bool heating = heated_sensor_ != nullptr && heat_known_ && !at_temp_;
+    const bool temp_ok = heated_sensor_ == nullptr || (heat_known_ && at_temp_);
     if (tap_open_sensor_ != nullptr)
       tap_open_sensor_->publish_state(tap_open);
     if (ready_sensor_ != nullptr)
-      ready_sensor_->publish_state(heated && !known_off && !rinse);
+      ready_sensor_->publish_state(ic_idle && temp_ok && !known_off && !rinse);
 
     std::string machine_status = "Ready";
     if (model_ == "F50") {
       // Impressa F50: highest priority last.
-      if (!heated)
-        machine_status = "Not Ready";  // heating up
+      if (!ic_idle)
+        machine_status = "Not Ready";  // programme running (or heating, without the heated sensor)
       if (rinse)
         machine_status = "Rinse Needed";  // startup rinse prompt
+      if (heating)
+        machine_status = "Heating";  // the rinse prompt is already set while heating, the display shows heating
       if (tap_open)
         machine_status = "Tap Open";
       if (!tank_ok)
@@ -739,6 +775,10 @@ class Jura : public PollingComponent, public uart::UARTDevice {
   bool rinse_pending_{false};
   bool rinse_needed_{false};
   bool rinse_known_{false};
+  binary_sensor::BinarySensor *heated_sensor_{nullptr};
+  bool heat_pending_{false};
+  bool at_temp_{false};
+  bool heat_known_{false};
   uint32_t maintenance_interval_ms_{60000};
   bool maintenance_pending_{false};
 
